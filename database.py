@@ -456,6 +456,24 @@ class Database:
             (status, error, next_attempt_at, now, chat_id, kind, period_key),
         )
 
+    def reset_scheduled_run(self, chat_id: int, kind: str, period_key: str, now: int) -> bool:
+        """Ручной повтор неудавшейся плановой задачи: планировщик подхватит её на следующей итерации.
+        Если сводка уже сгенерирована, она будет дослана без повторного обращения к LLM."""
+        return self.conn.execute(
+            "UPDATE scheduled_runs SET status = 'failed', attempts = 0, next_attempt_at = NULL, "
+            "lease_until = NULL, error = NULL, updated_at = ? "
+            "WHERE chat_id = ? AND kind = ? AND period_key = ? AND status IN ('failed', 'gave_up')",
+            (now, chat_id, kind, period_key),
+        ).rowcount > 0
+
+    def recent_scheduled_runs(self, limit: int = 20) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT r.*, s.status AS summary_status, s.parts_sent, s.parts_json "
+            "FROM scheduled_runs r LEFT JOIN summaries s ON s.id = r.summary_id "
+            "ORDER BY r.updated_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
     def get_scheduled_run(self, chat_id: int, kind: str, period_key: str) -> sqlite3.Row | None:
         return self.conn.execute(
             "SELECT * FROM scheduled_runs WHERE chat_id = ? AND kind = ? AND period_key = ?",

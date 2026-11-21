@@ -38,7 +38,7 @@ from config import BASE_DIR, ConfigError, load_settings  # noqa: E402
 from database import Database, MessageRecord  # noqa: E402
 from formatting import format_period, render_summary, split_blocks, strip_html  # noqa: E402
 from service import PERIOD_7D, PERIOD_24H  # noqa: E402
-from telegram_html_export import parse_html_export  # noqa: E402
+from telegram_html_export import find_html_files, parse_html_export  # noqa: E402
 
 
 # ------------------------------------------------------------------ разбор экспорта
@@ -188,6 +188,12 @@ def drop_external_replies(records: list[MessageRecord]) -> list[MessageRecord]:
 
 def load_export(path: Path, chat_query: str | None, chat_id: int | None, tz: ZoneInfo):
     """Возвращает (название чата, chat_id или None, записи). Поддерживает JSON и HTML."""
+    if not path.exists():
+        parent = path.parent
+        hint = ", ".join(sorted(p.name for p in parent.iterdir())[:20]) if parent.is_dir() else "каталог не найден"
+        raise SystemExit(f"Путь {path} не найден. Содержимое {parent}: {hint or 'пусто'}")
+    if path.is_dir() and not (path / "result.json").exists() and not find_html_files(path):
+        raise SystemExit(f"В {path} нет ни result.json, ни messages*.html — распакуйте экспорт в эту папку")
     if path.is_dir():
         json_file = path / "result.json"
         path = json_file if json_file.exists() else path

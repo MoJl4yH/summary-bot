@@ -312,6 +312,11 @@ class BotApp:
         if chat.type in GROUP_TYPES and not self.is_allowed_chat(chat) and self._throttled(chat.id, "chatid"):
             return
         text = f"ID этого чата: <code>{chat.id}</code>"
+        if getattr(chat, "is_forum", False) or getattr(message, "is_topic_message", False):
+            if getattr(message, "is_topic_message", False) and message.message_thread_id:
+                text += f"\nНомер этой темы: <code>{message.message_thread_id}</code> (для SUMMARY_THREAD_ID)"
+            else:
+                text += "\nЭто основная тема (General). Чтобы узнать номер другой темы, отправьте /chatid в ней."
         user = update.effective_user
         if message.sender_chat is not None or (user is not None and user.id == ANONYMOUS_ADMIN_ID):
             text += "\nВы пишете от имени группы или канала — ваш личный ID скрыт. Отправьте /chatid от своего имени."

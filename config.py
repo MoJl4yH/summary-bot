@@ -49,6 +49,7 @@ class Settings:
     group_chat_ids: frozenset[int]
     allowed_user_ids: frozenset[int]
     ignore_bot_messages: bool
+    summary_thread_ids: dict[int, int]  # chat_id -> message_thread_id для плановых сводок (форумы)
     # Расписание
     timezone: str
     daily_enabled: bool
@@ -90,6 +91,9 @@ class Settings:
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
+
+    def summary_thread_id(self, chat_id: int) -> int | None:
+        return self.summary_thread_ids.get(chat_id, self.summary_thread_ids.get(0))
 
     def secrets(self) -> list[str]:
         return [s for s in (self.telegram_bot_token, self.openrouter_api_key) if s]
@@ -171,6 +175,22 @@ class _Reader:
         self.errors.append(f"{name}='{value}' — ожидается день недели (monday..sunday или 1..7)")
         return WEEKDAYS[default]
 
+    def thread_map(self, name: str) -> dict[int, int]:
+        """«123» — тема 123 во всех группах; «-100…:123,-100…:456» — своя тема для каждой группы."""
+        value = self.raw(name)
+        if value is None:
+            return {}
+        result: dict[int, int] = {}
+        for part in re.split(r"[,\s;]+", value):
+            if not part:
+                continue
+            chat, sep, thread = part.rpartition(":")
+            try:
+                result[int(chat) if sep else 0] = int(thread)
+            except ValueError:
+                self.errors.append(f"{name}: '{part}' — ожидается номер темы или chat_id:номер_темы")
+        return result
+
     def int_set(self, name: str, *fallbacks: str) -> frozenset[int]:
         value = self.raw(name, *fallbacks)
         if value is None:
@@ -211,6 +231,7 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_dotenv: bool = Tr
         group_chat_ids=r.int_set("TELEGRAM_GROUP_CHAT_IDS", "ALLOWED_CHAT_IDS"),
         allowed_user_ids=r.int_set("ALLOWED_USER_IDS"),
         ignore_bot_messages=r.bool("IGNORE_BOT_MESSAGES", True),
+        summary_thread_ids=r.thread_map("SUMMARY_THREAD_ID"),
         timezone=timezone_name,
         daily_enabled=r.bool("DAILY_SUMMARY_ENABLED", True),
         daily_time=r.time("DAILY_SUMMARY_TIME", "22:00", "SUMMARY_TIME"),

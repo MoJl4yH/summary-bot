@@ -80,7 +80,11 @@ class TelegramPublisher:
                 if thread_id and "thread not found" in text:
                     thread_id = None
                     continue
-                raise PublishError(f"Telegram отклонил сообщение: {exc}", retryable=False) from exc
+                hint = ""
+                if "topic_closed" in text:
+                    hint = (" — тема закрыта для участников; укажите открытую тему в SUMMARY_THREAD_ID "
+                            "(номер темы покажет /chatid, отправленная внутри неё)")
+                raise PublishError(f"Telegram отклонил сообщение: {exc}{hint}", retryable=False) from exc
             except Forbidden as exc:
                 raise PublishError(f"нет доступа к чату: {exc}", retryable=False) from exc
             except ChatMigrated as exc:

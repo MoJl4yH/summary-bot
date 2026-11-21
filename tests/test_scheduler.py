@@ -216,3 +216,42 @@ async def test_empty_auto_summary_notice_is_configurable(tmp_path):
         assert "недостаточно для сводки" in h.bot.texts()[0]
     finally:
         await h.close()
+
+
+async def test_topic_closed_then_thread_configured_and_retried_without_llm(tmp_path):
+    """Тема General закрыта → задача сдаётся; после указания SUMMARY_THREAD_ID и ручного
+    повтора готовая сводка досылается в нужную тему без повторной генерации."""
+    from telegram.error import BadRequest
+
+    from config import load_settings
+    from conftest import make_env
+
+    now = ts(2026, 11, 21, 19, 1, 54)
+    period = "2026-11-21T22:00:00+03:00"
+    h1 = make(tmp_path, now, WEEKLY_SUMMARY_ENABLED="false", TELEGRAM_GROUP_CHAT_IDS=str(CHAT_A))
+    h1.add(CHAT_A, 1, 3600)
+    h1.add(CHAT_A, 2, 1800)
+    h1.bot.errors = [BadRequest("Topic_closed")]
+    assert await h1.scheduler.tick() == 1
+    run = h1.db.get_scheduled_run(CHAT_A, "daily", period)
+    assert run["status"] == "gave_up" and "SUMMARY_THREAD_ID" in run["error"]
+    assert len(h1.llm.requests) == 1
+    await h1.close()
+
+    h2 = build_harness(tmp_path, clock=Clock(now + 300), WEEKLY_SUMMARY_ENABLED="false",
+                       TELEGRAM_GROUP_CHAT_IDS=str(CHAT_A), SUMMARY_THREAD_ID="77")
+    try:
+        assert await h2.scheduler.tick() == 0  # сдавшаяся задача сама не повторяется
+        assert h2.db.reset_scheduled_run(CHAT_A, "daily", period, int(h2.clock()))
+        assert await h2.scheduler.tick() == 1
+        assert h2.llm.requests == []  # текст взят из базы
+        assert h2.bot.sent[0]["message_thread_id"] == 77
+        assert "Ежедневная сводка" in h2.bot.sent[0]["text"]
+        assert h2.db.get_scheduled_run(CHAT_A, "daily", period)["status"] == "done"
+        assert not h2.db.reset_scheduled_run(CHAT_A, "daily", period, int(h2.clock()))  # done не сбрасывается
+    finally:
+        await h2.close()
+
+    s = load_settings(make_env(tmp_path, SUMMARY_THREAD_ID=f"{CHAT_A}:5,{CHAT_B}:9"))
+    assert (s.summary_thread_id(CHAT_A), s.summary_thread_id(CHAT_B), s.summary_thread_id(-1)) == (5, 9, None)
+    assert load_settings(make_env(tmp_path, SUMMARY_THREAD_ID="12")).summary_thread_id(CHAT_B) == 12

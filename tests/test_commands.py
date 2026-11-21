@@ -180,3 +180,12 @@ async def test_status_restricted_to_allowed_users(tmp_path):
         assert "Состояние сервиса" in h.bot.texts()[-1]
     finally:
         await h.close()
+
+
+async def test_chatid_inside_forum_topic_shows_topic_id(h):
+    from conftest import tg_message
+    from telegram import Update
+
+    message = tg_message(CHAT_A, 950, user_id=USER_ALICE, text="/chatid", bot=h.bot, thread_id=4, is_topic=True)
+    await h.app.cmd_chatid(Update(update_id=950, message=message), context())
+    assert "Номер этой темы: <code>4</code>" in h.bot.texts()[-1]

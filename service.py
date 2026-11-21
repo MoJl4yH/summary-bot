@@ -298,13 +298,16 @@ class SummaryService:
                                 f"📋 {heading}: {n} {plural(n, 'сообщение', 'сообщения', 'сообщений')} "
                                 f"за {period.label} — недостаточно для сводки."
                             ),
+                            thread_id=self.settings.summary_thread_id(run.chat_id),
                         )
                     self.db.finish_scheduled_run(
                         run.chat_id, run.kind, run.period_key, status="skipped", now=self.now()
                     )
                     return
                 summary_id, parts, start = outcome.summary_id, outcome.parts, 0
-            await self.deliver(summary_id, run.chat_id, parts, start=start)
+            await self.deliver(
+                summary_id, run.chat_id, parts, start=start, thread_id=self.settings.summary_thread_id(run.chat_id)
+            )
             self.db.finish_scheduled_run(run.chat_id, run.kind, run.period_key, status="done", now=self.now())
         except (SummaryGenerationError, BudgetExceeded) as exc:
             self._fail_run(run, str(exc), retryable=True)
