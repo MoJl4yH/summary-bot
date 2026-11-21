@@ -1,0 +1,39 @@
+# Запуск: docker compose up -d --build
+name: summary-bot
+
+services:
+  bot:
+    build: .
+    image: summary-bot:local
+    pull_policy: build            # образ собирается только из локального исходного кода
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      # Пути внутри контейнера фиксированы: данные — только в томе /data
+      DATABASE_PATH: /data/bot.db
+      BACKUP_DIR: /data/backups
+      HEARTBEAT_PATH: /tmp/summary-bot.heartbeat
+    volumes:
+      - bot-data:/data
+    # Входящие порты не публикуются: бот работает через long polling (только исходящий HTTPS)
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    stop_grace_period: 40s
+    mem_limit: 512m
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  bot-data:

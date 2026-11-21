@@ -1,68 +1,424 @@
-# TG Summary Bot
+# Telegram Summary Bot
 
-**English** | [Русский](README.ru.md)
+Бот собирает сообщения групповых чатов Telegram и публикует содержательные сводки обсуждений, сформированные LLM через [OpenRouter](https://openrouter.ai/):
 
-A Telegram bot that quietly logs messages in your group chat and posts a daily digest of what was discussed — with clickable links to the start of each discussion topic.
+- **ежедневно** — за последние 24 часа, в настраиваемое время;
+- **еженедельно** — за последние 7 суток, в настраиваемые день и время;
+- **по команде** `/summary` (`/summary 24h`, `/summary 7d`) — с ограничением частоты на группу.
 
-Example digest:
+Работает через официальный Telegram Bot API (long polling) как обычный участник группы — права администратора не нужны. Внешние зависимости — только Telegram Bot API и OpenRouter API (исходящий HTTPS). Данные хранятся в локальной SQLite.
 
-> 📅 **Digest for 10.08.2026**
+Пример сводки:
+
+> **📋 Ежедневная сводка за 24 часа**
+> *20.11.2026 22:00 — 21.11.2026 22:00 (Europe/Moscow) · 134 сообщения · 9 участников*
 >
-> 🔹 [Landing page redesign](https://t.me/c/xxx/201): Oleg, Maria and Ivan decided to simplify the header — drop the carousel, keep a single offer.
-> 🔹 [SBP payments](https://t.me/c/xxx/205): Anya raised the payments question, Maria suggested YooKassa with lower fees.
+> **Основные темы**
+> 🔹 **Редизайн лендинга** — Олег и Мария предложили убрать карусель; Иван поддержал. [1] [2]
+> 🔹 **Оплата через СБП** — Аня подняла вопрос комиссий, сравнили двух провайдеров. [1]
 >
-> **Day's mood:** Productive day — clear next steps agreed on every topic
+> **Принятые решения**
+> • Оставить на главной один оффер без карусели [1]
+>
+> **Незакрытые вопросы**
+> • Какого провайдера СБП выбрать [1]
+>
+> **Итог**
+> Продуктивный день: по дизайну решение принято, по платежам нужна дополнительная информация.
 
-## How it works
+`[1]`, `[2]` — ссылки на исходные сообщения в Telegram.
 
-1. The bot saves all text messages and media captions from the configured groups into a local SQLite database (`data/messages.db`), including reply chains.
-2. Every day at the configured time (`SUMMARY_TIME`, default 22:00) the last 24 hours of messages are formatted as a log (`[HH:MM] Name (ID: 123): text`) and sent to an LLM via [OpenRouter](https://openrouter.ai/).
-3. The LLM returns structured JSON: discussion topics, a one-line summary with participant names, and the `start_message_id` of each topic.
-4. The bot builds a digest where every topic links to the first message of that discussion (`https://t.me/c/<chat_id>/<message_id>`) and posts it to the chat.
-5. After a successful scheduled run the processed messages are deleted; records older than 48 hours are cleaned up automatically.
+---
 
-## Setup
+## Содержание
 
-```bash
-git clone <repo-url> && cd tg-summary-bot
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
+1. [Архитектура](#архитектура)
+2. [Настройка Telegram](#настройка-telegram)
+3. [Настройка OpenRouter](#настройка-openrouter)
+4. [Развёртывание на VPS](#развёртывание-на-vps)
+5. [Конфигурация](#конфигурация)
+6. [Команды бота](#команды-бота)
+7. [Расписание](#расписание)
+8. [Ограничение ручных запросов](#ограничение-ручных-запросов)
+9. [Хранение данных](#хранение-данных)
+10. [Резервное копирование и восстановление](#резервное-копирование-и-восстановление)
+11. [Обновление](#обновление)
+12. [Журналы и мониторинг](#журналы-и-мониторинг)
+13. [Безопасность](#безопасность)
+14. [Тестирование](#тестирование)
+15. [Ограничения](#ограничения)
+
+---
+
+## Архитектура
+
+Один процесс Python (asyncio), один контейнер, одна база SQLite.
+
+```
+Telegram Bot API ──getUpdates──▶ bot.py (обработчики PTB) ──▶ database.py (SQLite, WAL)
+                                     │ /summary                  ▲
+                                     ▼                           │
+                               service.py ◀── scheduler.py (ежедневно/еженедельно, обслуживание)
+                                     │
+                     summary_generator.py ──▶ llm_client.py ──HTTPS──▶ OpenRouter
+                                     │
+                              formatting.py ──▶ telegram_io.py ──sendMessage──▶ Telegram
 ```
 
-Fill in `.env`:
-
-| Variable | Description |
+| Модуль | Назначение |
 |---|---|
-| `TELEGRAM_BOT_TOKEN` | Bot token from [@BotFather](https://t.me/BotFather) |
-| `TELEGRAM_GROUP_CHAT_IDS` | Group chat ID(s), comma-separated, e.g. `-1001234567890` |
-| `SUMMARY_TIME` | Daily posting time, `HH:MM` (default `22:00`) |
-| `TIMEZONE` | Timezone for the schedule and message timestamps (default `Europe/Moscow`) |
-| `OPENROUTER_API_KEY` | [OpenRouter](https://openrouter.ai/) API key for summary generation |
-| `LLM_MODEL` | Model name (default `google/gemini-3-flash-preview`) |
-| `DATABASE_PATH` | SQLite path (optional, default `./data/messages.db`) |
+| `bot.py` | Точка входа; обработчики сообщений и команд, проверка прав, корректная остановка по SIGTERM, heartbeat |
+| `config.py` | Загрузка и валидация настроек из окружения (`.env`), совместимость со старыми именами |
+| `database.py` | Схема и миграции SQLite, атомарные «захваты» задач и ручных запросов, учёт расходов |
+| `llm_client.py` | Клиент OpenAI-совместимого API OpenRouter: повторы, `Retry-After`, ошибки внутри HTTP 200, `usage.cost` |
+| `summary_generator.py` | Подготовка переписки, разбиение на фрагменты, многоэтапное суммирование, проверка схемы и ID сообщений |
+| `formatting.py` | HTML-разметка с экранированием, ссылки на сообщения, разбиение по лимиту Telegram |
+| `telegram_io.py` | Отправка с повторами (`RetryAfter`, тайм-ауты), запасной режим простого текста |
+| `service.py` | Сценарии: ручная сводка с лимитом, плановая сводка с повторами и идемпотентной публикацией |
+| `scheduler.py` | Планировщик слотов с учётом часового пояса; обслуживание (срок хранения, резервные копии) |
+| `backup.py` | Консистентная резервная копия SQLite (Online Backup API) |
+| `healthcheck.py` | Проверка состояния для Docker HEALTHCHECK |
+| `prompts/` | Системные промпты: суммирование фрагмента и слияние частичных сводок |
 
-## Telegram configuration
+**Конвейер генерации.** Сообщения за период выбираются из БД по полуинтервалу `[начало, конец)` и сериализуются в JSON-строки (`id`, время, автор, `reply_to`, текст). Если переписка не помещается в один запрос (`LLM_CHUNK_MAX_CHARS`), она режется на фрагменты: по каждому строится частичная сводка с `message_ids`, затем частичные сводки сливаются (при необходимости — иерархически). Ответ модели — JSON, который проверяется по схеме (pydantic) до публикации. Идентификаторы сообщений сверяются с реально переданной выборкой: несуществующие отбрасываются, поэтому ссылки ведут только на реальные сообщения. При меньше чем `MIN_MESSAGES_FOR_SUMMARY` сообщений LLM не вызывается.
 
-1. Create a bot with @BotFather and **disable privacy mode** (`/setprivacy` → Disable) — otherwise the bot won't see regular group messages.
-2. Add the bot to your group.
-3. Send `/chatid` in the group — the bot replies with the chat ID; put it into `TELEGRAM_GROUP_CHAT_IDS`.
-4. Restart the bot.
+---
 
-## Run
+## Настройка Telegram
+
+1. Создайте бота у [@BotFather](https://t.me/BotFather): `/newbot` → получите **токен**.
+2. **Отключите Privacy Mode**: `/setprivacy` → выберите бота → `Disable`. Иначе бот в группе видит только команды, а не обычные сообщения.
+   > Если бот уже был в группе до отключения Privacy Mode, удалите его из группы и добавьте заново — Telegram применяет настройку при добавлении.
+3. Добавьте бота в группу как **обычного участника** (права администратора не нужны).
+4. Отправьте в группе `/chatid` — бот ответит идентификатором (например, `-1001234567890`). Впишите его в `TELEGRAM_GROUP_CHAT_IDS` (несколько групп — через запятую) и перезапустите бота.
+5. (Рекомендуется) Ограничьте круг лиц, которые могут запускать `/summary` и смотреть `/status`: каждый, кому нужен доступ, отправляет в группе `/chatid` — бот покажет его `user_id`. Впишите ID через запятую в `ALLOWED_USER_IDS` (например, `ALLOWED_USER_IDS=123456789,987654321`) и выполните `docker compose up -d`. Пока список пуст, `/summary` и `/status` доступны всем участникам подключённых групп — об этом бот пишет предупреждение в журнал при запуске. Остальным участникам бот ответит «нет прав», обращения к OpenRouter не будет. Анонимные администраторы (пишущие от имени группы) не имеют личного ID и при заданном списке запускать `/summary` и `/status` не смогут. Команды `/chatid` и `/help` остаются доступны всем — они нужны для настройки.
+
+Важно:
+
+- Bot API не даёт доступа к старой истории: бот собирает сообщения **с момента подключения**.
+- Ссылки на сообщения вида `https://t.me/c/<id>/<msg>` работают только в **супергруппах** (ID начинается с `-100`) и открываются только участникам. В обычных группах сводка публикуется без ссылок. Если группа будет преобразована в супергруппу, её ID изменится — бот запишет в журнал предупреждение с новым ID, который нужно указать в `.env`.
+- Медиафайлы не скачиваются: сохраняются только тексты и подписи к медиа.
+
+---
+
+## Настройка OpenRouter
+
+1. Зарегистрируйтесь на [openrouter.ai](https://openrouter.ai/), пополните баланс и создайте ключ API: **Keys → Create Key**. Рекомендуется задать на ключе лимит расходов (credit limit) на стороне OpenRouter.
+2. Впишите ключ в `OPENROUTER_API_KEY`.
+3. Выберите модель в [каталоге](https://openrouter.ai/models) и укажите её идентификатор в `LLM_MODEL` (например, `google/gemini-3-flash-preview`). Модель должна поддерживать русский язык и ответ в формате JSON (`response_format: json_object`); подходят современные модели Gemini, Claude, GPT, Qwen, DeepSeek. Модель меняется без изменения кода — достаточно перезапуска.
+4. Настройте параметры: `LLM_TEMPERATURE`, `LLM_MAX_OUTPUT_TOKENS`, `LLM_TIMEOUT_SECONDS`.
+
+**Контроль расходов** (на уровне бота):
+
+| Механизм | Параметр |
+|---|---|
+| Порог «мало сообщений» — LLM не вызывается | `MIN_MESSAGES_FOR_SUMMARY` |
+| Обрезка длинных сообщений | `MAX_MESSAGE_CHARS` |
+| Максимальный объём переписки на сводку (берутся самые новые) | `LLM_MAX_INPUT_CHARS` |
+| Максимум обращений к LLM на одну сводку | `LLM_MAX_CALLS_PER_SUMMARY` |
+| Бюджет на скользящие 24 часа (по `usage.cost` из ответов OpenRouter) | `LLM_DAILY_BUDGET_USD` |
+| Частота ручных сводок | `MANUAL_SUMMARY_COOLDOWN_SECONDS` |
+
+Количество токенов и стоимость каждого вызова сохраняются в БД (`llm_usage`) и видны в `/status`.
+
+---
+
+## Развёртывание на VPS
+
+### Требования
+
+- Linux VPS (x86_64 или arm64), 512 МБ RAM достаточно;
+- Docker Engine 24+ и Docker Compose v2.24+ (`docker compose version`);
+- исходящий доступ к `api.telegram.org:443` и `openrouter.ai:443`. Входящие порты не нужны.
+
+### Установка Docker (Debian/Ubuntu)
 
 ```bash
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker "$USER"   # перелогиньтесь после этого
+```
+
+### Запуск
+
+```bash
+git clone <URL вашего репозитория> summary-bot
+cd summary-bot
+cp .env.example .env
+chmod 600 .env
+nano .env            # TELEGRAM_BOT_TOKEN, TELEGRAM_GROUP_CHAT_IDS, OPENROUTER_API_KEY, расписание
+docker compose up -d --build
+```
+
+Проверка:
+
+```bash
+docker compose ps          # STATUS: Up … (healthy) — через ~1–2 минуты после старта
+docker compose logs -f bot # «Бот @… запущен; группы: …»
+```
+
+Затем в группе: `/status`, `/summary`.
+
+### Управление
+
+| Действие | Команда |
+|---|---|
+| Запуск / пересборка | `docker compose up -d --build` |
+| Остановка (данные сохраняются) | `docker compose stop` |
+| Остановка и удаление контейнера (том с данными остаётся) | `docker compose down` |
+| Перезапуск (например, после правки `.env`) | `docker compose up -d` |
+| Журналы в реальном времени | `docker compose logs -f bot` |
+| Последние 200 строк журнала | `docker compose logs --tail 200 bot` |
+| Состояние и healthcheck | `docker compose ps` |
+| Резервная копия вручную | `docker compose exec bot python backup.py` |
+
+> ⚠️ `docker compose down -v` **удаляет том с базой данных**. Не используйте `-v`, если не хотите потерять историю.
+
+Контейнер запускается с политикой `restart: unless-stopped`, от непривилегированного пользователя (UID 10001), с корневой ФС только для чтения, без Linux-capabilities и с `no-new-privileges`. Данные — в именованном томе `summary-bot_bot-data` (`/data` в контейнере). При остановке бот получает SIGTERM, прекращает приём обновлений, ждёт до 20 секунд завершения начатой ручной сводки и закрывает БД (`stop_grace_period: 40s`).
+
+### Запуск без Docker (для разработки)
+
+```bash
+python3.12 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env && nano .env   # DATABASE_PATH по умолчанию ./data/messages.db
 python bot.py
 ```
 
-## Commands
+---
 
-- `/summary` (or `/daily_summary`) — generate a digest for the last 24 hours on demand (does not delete messages from the database).
-- `/chatid` — show the current chat ID.
+## Конфигурация
 
-## Notes
+Все параметры задаются в `.env`; полный пример с комментариями — [`.env.example`](.env.example). При ошибке в конфигурации бот не запускается и выводит список всех проблем.
 
-- `t.me/c/...` links work for supergroups (IDs starting with `-100`) and open only for chat members.
-- The system prompt for topic extraction lives in [prompts/daily_summary.txt](prompts/daily_summary.txt) — tune it to your chat's style.
-- No external database required: everything is stored in a single SQLite file.
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | — | **Обязательно.** Токен от @BotFather |
+| `TELEGRAM_GROUP_CHAT_IDS` | — | **Обязательно.** ID разрешённых групп через запятую |
+| `ALLOWED_USER_IDS` | пусто | `user_id`, которым разрешён `/summary`; пусто — всем участникам разрешённых групп |
+| `IGNORE_BOT_MESSAGES` | `true` | Не сохранять сообщения других ботов |
+| `OPENROUTER_API_KEY` | — | **Обязательно.** Ключ OpenRouter |
+| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | Базовый URL API |
+| `LLM_MODEL` | `google/gemini-3-flash-preview` | Модель OpenRouter |
+| `LLM_TEMPERATURE` | `0.2` | Температура |
+| `LLM_MAX_OUTPUT_TOKENS` | `4000` | Максимум выходных токенов |
+| `LLM_TIMEOUT_SECONDS` | `120` | Сетевой тайм-аут запроса |
+| `LLM_MAX_RETRIES` | `4` | Повторы при 408/429/5xx и сетевых ошибках |
+| `LLM_INVALID_JSON_RETRIES` | `1` | Повторы при ответе, не прошедшем проверку схемы |
+| `LLM_CHUNK_MAX_CHARS` | `60000` | Размер фрагмента переписки в одном запросе |
+| `LLM_MAX_INPUT_CHARS` | `400000` | Максимальный объём переписки на сводку |
+| `LLM_MAX_CALLS_PER_SUMMARY` | `12` | Максимум вызовов LLM на сводку |
+| `LLM_DAILY_BUDGET_USD` | `0` (без лимита) | Бюджет за скользящие 24 часа |
+| `MAX_MESSAGE_CHARS` | `2000` | Обрезка одного сообщения перед отправкой в LLM |
+| `TIMEZONE` | `Europe/Moscow` | Часовой пояс расписания и времени в сводках |
+| `DAILY_SUMMARY_ENABLED` | `true` | Ежедневная сводка |
+| `DAILY_SUMMARY_TIME` | `22:00` | Время ежедневной сводки (`HH:MM`) |
+| `WEEKLY_SUMMARY_ENABLED` | `true` | Еженедельная сводка |
+| `WEEKLY_SUMMARY_DAY` | `sunday` | День недели: `monday`…`sunday`, `1`…`7` или по-русски |
+| `WEEKLY_SUMMARY_TIME` | `23:00` | Время еженедельной сводки |
+| `MISSED_SUMMARY_MAX_DELAY_HOURS` | `12` | Насколько поздно ещё публиковать пропущенную сводку |
+| `SCHEDULED_SUMMARY_MAX_ATTEMPTS` | `5` | Попыток на одну плановую сводку |
+| `MANUAL_SUMMARY_COOLDOWN_SECONDS` | `3600` | Интервал между успешными ручными сводками в группе |
+| `MIN_MESSAGES_FOR_SUMMARY` | `5` | Минимум сообщений для обращения к LLM |
+| `POST_EMPTY_AUTO_SUMMARY` | `false` | Публиковать уведомление, если для плановой сводки мало сообщений |
+| `MESSAGE_RETENTION_DAYS` | `30` | Срок хранения сообщений (минимум 8) |
+| `BACKUP_ENABLED` / `BACKUP_KEEP` | `true` / `7` | Ежедневная резервная копия и число хранимых копий |
+| `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+
+**Совместимость со старой версией:** `SUMMARY_TIME` по-прежнему работает как `DAILY_SUMMARY_TIME` (если последний не задан); `TELEGRAM_GROUP_CHAT_IDS`, `LLM_MODEL`, `TIMEZONE`, `DATABASE_PATH` не изменились. Старая таблица `daily_logs` автоматически переносится в новую схему при первом запуске.
+
+---
+
+## Команды бота
+
+| Команда | Где работает | Что делает |
+|---|---|---|
+| `/summary` | разрешённые группы, пользователи из `ALLOWED_USER_IDS` | Сводка за последние 24 часа от момента запроса |
+| `/summary 24h` | разрешённые группы | То же |
+| `/summary 7d` | разрешённые группы | Сводка за последние 7 суток |
+| `/status` | разрешённые группы, пользователи из `ALLOWED_USER_IDS` | Версия, модель, число сообщений, расписание, доступность `/summary`, последняя генерация (токены, стоимость, ошибка), расход за 24 ч |
+| `/chatid` | любая группа или личный чат | ID текущего чата и ваш `user_id` (с отметкой, есть ли он в `ALLOWED_USER_IDS`) — для настройки |
+| `/help` | везде | Список команд |
+
+Отредактированная команда повторно не выполняется. Ответы-отказы в одном чате не чаще раза в 30 секунд (защита от флуда). Других действий бот не выполняет: команды ОС, изменение настроек и любые просьбы участников внутри переписки игнорируются.
+
+---
+
+## Расписание
+
+- **Ежедневная сводка** запускается в `DAILY_SUMMARY_TIME` по `TIMEZONE` и охватывает полуинтервал `[T − 24 ч, T)`, где `T` — запланированное время (а не фактическое время запуска).
+- **Еженедельная сводка** запускается в `WEEKLY_SUMMARY_DAY` в `WEEKLY_SUMMARY_TIME` и охватывает `[T − 7 сут, T)`. Настройки независимы от ежедневной; обе сводки в одно время не мешают друг другу.
+- Интервалы — абсолютное время: при переходе на летнее/зимнее время «24 часа» — это ровно 24 часа.
+- Каждая задача идентифицируется ключом `(группа, тип, запланированное время)` и атомарно фиксируется в таблице `scheduled_runs`. Повторно одна и та же сводка не создаётся — ни при перезапуске, ни при нескольких итерациях планировщика.
+- **Пропущенный запуск** (сервис был выключен): после старта выполняется только последняя по времени сводка каждого типа и только если с запланированного момента прошло не больше `MISSED_SUMMARY_MAX_DELAY_HOURS`. Слоты, наступившие до первой установки бота, не догоняются.
+- **Ошибки**: при сбое OpenRouter или Telegram задача повторяется через 5, 10, 20, 40, 60 минут (до `SCHEDULED_SUMMARY_MAX_ATTEMPTS` попыток). Готовый текст сохраняется в БД и учитываются уже отправленные части, поэтому при повторе или после перезапуска досылаются только оставшиеся части — без повторного обращения к LLM.
+- Если сообщений меньше `MIN_MESSAGES_FOR_SUMMARY`, плановая сводка пропускается (или публикуется короткое уведомление при `POST_EMPTY_AUTO_SUMMARY=true`).
+- Расписание общее для всех подключённых групп.
+
+---
+
+## Ограничение ручных запросов
+
+- Не более одной **успешной** ручной сводки за `MANUAL_SUMMARY_COOLDOWN_SECONDS` (по умолчанию час) **на группу**: лимит общий для всех участников.
+- Повторный запрос в течение интервала не обращается к OpenRouter; бот сообщает, когда можно запросить следующую сводку.
+- Начало генерации фиксируется атомарно (транзакция `BEGIN IMMEDIATE` в SQLite): параллельные `/summary` запускают ровно одну генерацию, остальные получают «сводка уже формируется».
+- Лимит расходуется, только если сводка сформирована **и** полностью отправлена. Ошибка OpenRouter, некорректный ответ модели, сбой отправки или «мало сообщений» лимит не тратят.
+- Состояние хранится в SQLite (`manual_state`) и переживает перезапуск контейнера.
+- Плановые сводки в лимит не входят; ручные не удаляют сообщения и не влияют на расписание.
+
+---
+
+## Хранение данных
+
+SQLite в режиме WAL, файл `/data/bot.db` в томе Docker. Схема версионируется (`PRAGMA user_version`) и мигрирует автоматически при обновлении.
+
+| Таблица | Содержимое |
+|---|---|
+| `messages` | Сообщения: `chat_id`, `message_id` (уникальная пара), `user_id`, `username`, имя, `date`, текст, `reply_to_message_id`, `message_thread_id`, `edit_date`. Индексы по `(chat_id, date)` и `date` |
+| `scheduled_runs` | Состояние плановых задач: период, статус, попытки, ссылка на сводку |
+| `summaries` | Метаданные сводок: период, число сообщений, вызовы LLM, токены, стоимость, части текста, сколько отправлено, ошибка |
+| `manual_state` | Ограничение частоты ручных запросов по группам |
+| `llm_usage` | Каждый вызов LLM: токены, стоимость, задержка |
+| `meta` | Служебное: время установки, последнего обслуживания |
+
+- Повторно доставленные обновления не создают дубликатов (`ON CONFLICT DO NOTHING`); правки сообщений обновляют текст.
+- **История не удаляется после сводок** — она нужна для еженедельной сводки и повторных запросов. Устаревшие сообщения (старше `MESSAGE_RETENTION_DAYS`) удаляет отдельная задача обслуживания раз в сутки. Служебные записи старше 365 дней также удаляются.
+
+---
+
+## Резервное копирование и восстановление
+
+**Автоматически:** раз в сутки задача обслуживания делает консистентную копию (SQLite Online Backup API, без остановки бота) в `/data/backups/bot-ГГГГММДД-ЧЧММСС.db` и хранит `BACKUP_KEEP` последних копий.
+
+**Вручную:**
+
+```bash
+docker compose exec bot python backup.py
+```
+
+**Выгрузить копии на хост** (и затем — за пределы VPS, например, `rsync`/`restic` на другой сервер):
+
+```bash
+docker compose cp bot:/data/backups ./backups
+chmod -R go-rwx ./backups
+```
+
+Копии лежат в том же томе, что и база, поэтому от потери VPS они не защищают — регулярно выносите их наружу. Пример ежедневной задачи cron на хосте:
+
+```cron
+30 4 * * * cd /opt/summary-bot && docker compose exec -T bot python backup.py >/dev/null && docker compose cp bot:/data/backups ./backups
+```
+
+**Восстановление из копии:**
+
+```bash
+docker compose stop bot
+docker compose run --rm --no-deps -v "$PWD/backups:/restore:ro" --entrypoint sh bot \
+  -c 'cp /restore/bot-20261121-040000.db /data/bot.db && rm -f /data/bot.db-wal /data/bot.db-shm'
+docker compose up -d
+```
+
+**Перенос данных со старой версии бота** (запускавшейся через `python bot.py`, файл `data/messages.db`): скопируйте файл в том так же, как при восстановлении (`cp /restore/messages.db /data/bot.db`) — таблица `daily_logs` будет перенесена автоматически.
+
+---
+
+## Обновление
+
+```bash
+cd summary-bot
+docker compose exec bot python backup.py   # копия перед обновлением
+git fetch && git log --oneline HEAD..origin/main   # просмотрите изменения
+git pull --ff-only
+docker compose up -d --build
+docker compose logs -f bot
+```
+
+Образ собирается только локально из проверенного исходного кода (`pull_policy: build`); автоматического обновления образов нет. Базовый образ `python:3.12-slim` закреплён по digest в `Dockerfile`. Чтобы получить обновления безопасности базового образа, выполните `docker pull python:3.12-slim`, посмотрите новый digest (`docker image inspect python:3.12-slim --format '{{index .RepoDigests 0}}'`), обновите строку `FROM`, прогоните тесты и пересоберите. Версии Python-зависимостей зафиксированы в `requirements.txt`.
+
+---
+
+## Журналы и мониторинг
+
+- Журналы пишутся в stdout, Docker хранит их с ротацией (5 файлов по 10 МБ): `docker compose logs -f bot`.
+- В журнал **не попадают** токен Telegram, ключ OpenRouter (маскируются, в том числе в трассировках исключений) и тексты сообщений участников. Пишутся только счётчики, статусы, токены, стоимость и ошибки.
+- `HEALTHCHECK`: процесс раз в 30 с обновляет файл-heartbeat, пока работают long polling и планировщик. Если файл не обновлялся больше 180 с — контейнер помечается `unhealthy`.
+- `/status` в группе показывает последнюю генерацию, её ошибку и расход за сутки.
+
+Коды завершения: `2` — ошибка конфигурации, `3` — Telegram отклонил токен.
+
+---
+
+## Безопасность
+
+- Секреты — только в `.env` (права `600`), файл исключён из Git и из контекста сборки образа (`.gitignore`, `.dockerignore`). База и журналы в Git не попадают.
+- Контейнер: непривилегированный пользователь, корневая ФС только для чтения, `cap_drop: ALL`, `no-new-privileges`, ограничения памяти и числа процессов, никаких опубликованных портов.
+- Доступ: сообщения и команды принимаются только из групп `TELEGRAM_GROUP_CHAT_IDS`; ручная генерация и `/status` — только для `ALLOWED_USER_IDS` (если задан).
+- Защита от повторных дорогостоящих запросов: атомарная блокировка и лимит частоты, суточный бюджет, лимиты объёма и числа вызовов LLM.
+- **Prompt injection**: переписка передаётся модели как JSON-данные внутри явно размеченного блока; системный промпт требует считать её недоверенными данными и игнорировать инструкции участников. Ответ модели не исполняется: принимается только JSON заданной схемы, который используется как текст. ID сообщений проверяются, весь текст экранируется перед отправкой (HTML), сырой ответ модели никогда не публикуется.
+- Бот не исполняет команд ОС и не выполняет действий, кроме сбора сообщений, выдачи состояния и формирования сводок.
+- Файлы БД и резервных копий создаются с правами `600`, каталоги — `700`.
+
+---
+
+## Проверка на реальной переписке (экспорт Telegram Desktop)
+
+Bot API не даёт доступа к истории, поэтому для проверки качества сводок на реальных данных (и для начального заполнения базы) используется экспорт чата.
+
+1. **Telegram Desktop** (Windows/Linux/macOS-версия «Telegram Desktop»; в мобильных приложениях экспорта нет) → откройте группу → **⋮ → Экспорт истории чата**. Снимите все галочки медиа (фото, видео, файлы — не нужны), формат — **«Машиночитаемый JSON»**, период — например, с вчерашней даты. Получится папка `ChatExport_ГГГГ-ММ-ДД/` с файлом `result.json`. Если в группе включён запрет на копирование контента, экспорт недоступен.
+2. Положите папку в `exports/` в каталоге проекта (каталог исключён из Git и из образа).
+3. Запустите (нужен `OPENROUTER_API_KEY` в `.env` или окружении; сводка **не публикуется** в Telegram):
+
+```bash
+pip install -r requirements.txt
+# оценка объёма и числа вызовов LLM, без ключа и без расходов
+python tools/summarize_export.py exports/ChatExport_2026-11-21/result.json --end last --dry-run
+# сводка за 24 часа до последнего сообщения экспорта (--end now — до текущего момента)
+python tools/summarize_export.py exports/ChatExport_2026-11-21/result.json --end last
+# за 7 дней
+python tools/summarize_export.py exports/ChatExport_2026-11-21/result.json --end last --period 7d
+```
+
+Результат выводится в консоль и сохраняется в `summary-preview.html` (вид как в Telegram, со ссылками), вместе с числом вызовов, токенами и стоимостью. Используются те же промпты, лимиты и настройки модели из `.env`, что и у бота.
+
+**Загрузка истории в базу бота** — чтобы ежедневная/еженедельная сводка сразу учитывала прошлые сообщения:
+
+```bash
+docker compose run --rm --no-deps -v "$PWD/exports:/exports:ro" bot \
+  python tools/summarize_export.py /exports/ChatExport_2026-11-21/result.json --import-db /data/bot.db --no-summary
+```
+
+Повторный импорт безопасен — существующие сообщения не дублируются. Учтите, что переписка отправляется в OpenRouter и далее провайдеру модели.
+
+---
+
+## Тестирование
+
+Тесты используют подменные Telegram и OpenRouter (`httpx.MockTransport`) и не расходуют реальные ключи.
+
+```bash
+python3.12 -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+| Файл | Что проверяется |
+|---|---|
+| `tests/test_storage.py` | Сохранение сообщения со всеми полями, подписи к медиа, дубликаты, правки, изоляция групп, игнорирование чужих групп, срок хранения, WAL/индексы, миграция `daily_logs` |
+| `tests/test_summary.py` | Окна 24 ч / 7 сут и их границы, порог сообщений, проверка ссылок и ID, экранирование HTML, разбиение длинных сводок, prompt injection, map-reduce, лимит объёма, учёт стоимости, бюджет |
+| `tests/test_commands.py` | Ограничение частоты (общий лимит группы, время следующего запроса, переживание перезапуска), параллельные `/summary`, плановые сводки вне лимита, отказ неразрешённым группам и пользователям, `/status`, `/chatid`, `/help` |
+| `tests/test_failures.py` | Отказы OpenRouter (5xx с повторами и backoff, 429 с `Retry-After`, 401 без повторов, ошибка внутри HTTP 200, обрезанный ответ), некорректный JSON, ошибки Telegram (Forbidden, RetryAfter, тайм-аут, ошибка разметки), повтор плановой отправки без регенерации |
+| `tests/test_scheduler.py` | Слоты и часовые пояса (включая переход на зимнее время), однократность, сохранение истории после ежедневной сводки и её использование в еженедельной, догоняющий запуск, перезапуск во время генерации и во время отправки, исчерпание попыток |
+| `tests/test_export_tool.py` | Разбор экспорта Telegram Desktop (форматы текста, служебные сообщения, каналы, старые даты), выбор чата, генерация превью и импорт в БД |
+| `tests/test_config_and_routing.py` | Конфигурация и совместимость, маскирование секретов, маршрутизация обновлений через настоящий `telegram.ext.Application` |
+
+---
+
+## Ограничения
+
+- Bot API не предоставляет старую историю: сводки строятся по сообщениям, полученным после подключения бота.
+- Telegram хранит неполученные обновления около 24 часов: если бот был выключен дольше, часть сообщений за это время будет потеряна.
+- Изображения, видео, голосовые и прочие медиа не анализируются — только тексты и подписи. Удаление сообщений Bot API не сообщает, поэтому удалённые в Telegram сообщения остаются в базе до истечения срока хранения.
+- Ссылки на сообщения работают только в супергруппах и только для участников группы.
+- Если Telegram ответил тайм-аутом, но фактически доставил сообщение, при повторе возможен дубль одной части сводки (Bot API не поддерживает идемпотентную отправку). Аналогично при аварийном завершении процесса ровно между отправкой части и записью об этом в БД.
+- Сводки по темам форумов не разделяются: сводка строится по всей группе и публикуется в основную тему (ручная — в ту тему, где вызвана команда).
+- Расписание общее для всех групп. Рассчитано на один экземпляр бота на один токен (Telegram не позволяет двум процессам одновременно получать обновления).
+- Качество сводки зависит от выбранной модели; модель должна поддерживать JSON-ответ.

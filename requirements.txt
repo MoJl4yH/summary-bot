@@ -1,4 +1,6 @@
-python-telegram-bot>=21.0
-python-dotenv>=1.0
-openai>=1.0
-httpx>=0.24.0
+# Зависимости бота (версии зафиксированы; обновлять осознанно, с прогоном тестов)
+python-telegram-bot==22.8
+httpx==0.28.1
+pydantic==2.14.4
+python-dotenv==1.2.4
+tzdata==2026.6

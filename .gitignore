@@ -1,6 +1,32 @@
+# Секреты
 .env
+.env.*
+!.env.example
+
+# Данные и резервные копии
 data/
+backups/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+
+# Журналы
+*.log
+logs/
+
+# Python
 __pycache__/
 *.pyc
 .venv/
 venv/
+.pytest_cache/
+.ruff_cache/
+
+# Экспорты переписки и превью сводок (персональные данные)
+exports/
+ChatExport*/
+ChatExport*.zip
+*.zip
+result.json
+summary-preview*.html
