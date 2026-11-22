@@ -78,7 +78,7 @@ async def test_tool_generates_preview_and_imports(tmp_path, monkeypatch, capsys)
     monkeypatch.setenv("MIN_MESSAGES_FOR_SUMMARY", "2")
     db_path = tmp_path / "bot.db"
     args = Namespace(export=str(export), chat=None, chat_id=None, export_tz=None, period="24h", end="last",
-                     out=str(tmp_path / "preview.html"), dry_run=False, import_db=str(db_path), no_summary=False)
+                     out=str(tmp_path / "preview.html"), dry_run=False, import_db=str(db_path), no_summary=False, thread=None)
 
     assert await tool.run(args) == 0
     out = capsys.readouterr().out
@@ -98,7 +98,7 @@ async def test_tool_dry_run_needs_no_key(tmp_path, monkeypatch, capsys):
     export.write_text(json.dumps(export_sample(), ensure_ascii=False), encoding="utf-8")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     args = Namespace(export=str(export), chat=None, chat_id=None, export_tz=None, period="7d", end="last",
-                     out=str(tmp_path / "p.html"), dry_run=True, import_db=None, no_summary=False)
+                     out=str(tmp_path / "p.html"), dry_run=True, import_db=None, no_summary=False, thread=None)
     assert await tool.run(args) == 0
     assert "Объём для LLM" in capsys.readouterr().out
 
@@ -160,7 +160,7 @@ def test_html_export_parsing(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-testkey0123456789")
     monkeypatch.setenv("MIN_MESSAGES_FOR_SUMMARY", "2")
     args = Namespace(export=str(tmp_path / "messages.html"), chat=None, chat_id=None, export_tz=None, period="24h",
-                     end="last", out=str(tmp_path / "p.html"), dry_run=False, import_db=None, no_summary=False)
+                     end="last", out=str(tmp_path / "p.html"), dry_run=False, import_db=None, no_summary=False, thread=None)
     assert await_run(args) == 0
     assert "<code>#10</code>" in (tmp_path / "p.html").read_text(encoding="utf-8")  # без chat_id — номера
 
@@ -169,3 +169,47 @@ def await_run(args):
     import asyncio
 
     return asyncio.run(tool.run(args))
+
+
+def test_infer_topics_from_reply_chains():
+    from database import MessageRecord
+
+    def rec(mid, reply=None):
+        return MessageRecord(-100, mid, None, None, "A", 1000 + mid, "t", reply_to_message_id=reply)
+
+    records = tool.infer_topics([
+        rec(10, reply=4),      # ответ на корень темы 4 (корня нет в выгрузке)
+        rec(11, reply=10),     # ответ внутри темы 4
+        rec(12, reply=11),     # глубже по цепочке
+        rec(13),               # без ответа — General
+        rec(14, reply=13),     # ответ в General
+        rec(15, reply=71168),  # другая тема
+    ])
+    assert [r.message_thread_id for r in records] == [4, 4, 4, None, None, 71168]
+
+
+async def test_reimport_fills_topics_for_existing_rows(tmp_path, monkeypatch):
+    export = tmp_path / "result.json"
+    data = export_sample()
+    data["messages"].append({"id": 7, "type": "message", "date_unixtime": str(NOW - 300), "from": "Мария",
+                             "from_id": "user222", "reply_to_message_id": 4, "text": "в той же теме"})
+    for m in data["messages"]:
+        if m["id"] == 3:
+            m["reply_to_message_id"] = 1000  # корень темы 1000 вне выгрузки
+    export.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    db_path = tmp_path / "bot.db"
+    db = Database(str(db_path))
+    db.ensure_schema()
+    from database import MessageRecord
+    db.upsert_message(MessageRecord(-1001234567890, 3, 111, None, "Иван", NOW - 3600, "старый импорт"), NOW)
+    db.close()
+
+    args = Namespace(export=str(export), chat=None, chat_id=None, export_tz=None, period="24h", end="last",
+                     out=str(tmp_path / "p.html"), dry_run=False, import_db=str(db_path), no_summary=True,
+                     thread=None)
+    assert await tool.run(args) == 0
+    db = Database(str(db_path))
+    threads = {m.message_id: m.message_thread_id for m in db.get_messages(-1001234567890, 0, NOW * 2)}
+    db.close()
+    assert threads[3] == 1000 and threads[4] == 1000 and threads[7] == 1000  # 4 отвечает на 3 → тема 1000
+    assert threads[2] is None and threads[6] is None

@@ -112,7 +112,7 @@ class SummaryService:
         )
         if on_created:
             on_created(summary_id)
-        messages = self.db.get_messages(chat_id, window_start, window_end)
+        messages = self.db.get_messages(chat_id, window_start, window_end, self.settings.source_threads(chat_id))
         if len(messages) < self.settings.min_messages:
             self.db.update_summary(summary_id, self.now(), status="empty", message_count=len(messages))
             logger.info(

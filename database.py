@@ -290,12 +290,23 @@ class Database:
             sql = insert + "ON CONFLICT(chat_id, message_id) DO NOTHING"
         return self.conn.execute(sql, params).rowcount > 0
 
-    def get_messages(self, chat_id: int, start_ts: int, end_ts: int) -> list[MessageRecord]:
-        """Сообщения чата в полуинтервале [start_ts, end_ts) по возрастанию времени."""
+    @staticmethod
+    def _thread_filter(thread_ids) -> tuple[str, tuple]:
+        if not thread_ids:
+            return "", ()
+        ids = tuple(sorted(thread_ids))
+        return f" AND message_thread_id IN ({','.join('?' * len(ids))})", ids
+
+    def get_messages(
+        self, chat_id: int, start_ts: int, end_ts: int, thread_ids: frozenset[int] | None = None
+    ) -> list[MessageRecord]:
+        """Сообщения чата в полуинтервале [start_ts, end_ts) по возрастанию времени;
+        thread_ids — только из этих тем форума."""
+        where, params = self._thread_filter(thread_ids)
         rows = self.conn.execute(
-            "SELECT * FROM messages WHERE chat_id = ? AND date >= ? AND date < ? "
-            "ORDER BY date ASC, message_id ASC",
-            (chat_id, start_ts, end_ts),
+            "SELECT * FROM messages WHERE chat_id = ? AND date >= ? AND date < ?" + where
+            + " ORDER BY date ASC, message_id ASC",
+            (chat_id, start_ts, end_ts, *params),
         ).fetchall()
         return [
             MessageRecord(
@@ -307,14 +318,26 @@ class Database:
             for row in rows
         ]
 
-    def count_messages(self, chat_id: int, since_ts: int | None = None) -> int:
-        if since_ts is None:
-            row = self.conn.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ?", (chat_id,)).fetchone()
-        else:
-            row = self.conn.execute(
-                "SELECT COUNT(*) FROM messages WHERE chat_id = ? AND date >= ?", (chat_id, since_ts)
-            ).fetchone()
-        return row[0]
+    def count_messages(
+        self, chat_id: int, since_ts: int | None = None, thread_ids: frozenset[int] | None = None
+    ) -> int:
+        where, params = self._thread_filter(thread_ids)
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE chat_id = ? AND date >= ?" + where,
+            (chat_id, since_ts or 0, *params),
+        ).fetchone()[0]
+
+    def fill_thread_ids(self, items: list[tuple[int, int, int]]) -> int:
+        """Проставляет номер темы сообщениям, у которых его нет (импорт истории).
+        items — (thread_id, chat_id, message_id). Уже заполненные значения не меняются."""
+        with self.transaction() as c:
+            before = c.total_changes
+            c.executemany(
+                "UPDATE messages SET message_thread_id = ? "
+                "WHERE chat_id = ? AND message_id = ? AND message_thread_id IS NULL",
+                items,
+            )
+            return c.total_changes - before
 
     def delete_messages_before(self, before_ts: int) -> int:
         """Задача обслуживания: удаление сообщений старше срока хранения."""

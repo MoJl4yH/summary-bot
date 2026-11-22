@@ -86,7 +86,8 @@ def extract_record(message: Message, *, ignore_bots: bool = True) -> MessageReco
         date=int(message.date.timestamp()),
         text=text,
         reply_to_message_id=reply_to,
-        message_thread_id=message.message_thread_id,
+        # Только темы форума; у ответов вне тем Bot API тоже заполняет message_thread_id (корень цепочки)
+        message_thread_id=message.message_thread_id if message.is_topic_message else None,
         edit_date=int(message.edit_date.timestamp()) if message.edit_date else None,
     )
 
@@ -261,6 +262,12 @@ class BotApp:
             f"Сообщений в базе: за 24 ч — {self.db.count_messages(chat_id, now - DAY)}, "
             f"всего — {self.db.count_messages(chat_id)} (хранение {s.message_retention_days} дн.)",
         ]
+        threads = s.source_threads(chat_id)
+        if threads:
+            lines.append(
+                f"Сводки учитывают только темы: {', '.join(map(str, sorted(threads)))} "
+                f"(за 24 ч в них {self.db.count_messages(chat_id, now - DAY, threads)} сообщ.)"
+            )
         if s.daily_enabled:
             nxt = next_daily_slot(now_dt, s.tz, s.daily_time)
             lines.append(f"Ежедневная сводка: в {s.daily_time:%H:%M}, следующая — {nxt:%d.%m.%Y %H:%M}")

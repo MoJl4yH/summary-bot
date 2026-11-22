@@ -12,7 +12,7 @@ from database import Database
 async def test_incoming_message_is_saved_with_all_fields(h):
     """Сценарий 1: сохранение входящего сообщения."""
     original = tg_message(CHAT_A, 10, text="Исходное")
-    reply = tg_message(CHAT_A, 11, text="Ответ", reply_to=original, thread_id=10,
+    reply = tg_message(CHAT_A, 11, text="Ответ", reply_to=original, thread_id=4, is_topic=True,
                        date=datetime.fromtimestamp(T0 - 60, timezone.utc))
     await h.app.on_message(Update(update_id=1, message=reply), context())
 
@@ -25,7 +25,7 @@ async def test_incoming_message_is_saved_with_all_fields(h):
     assert saved.date == T0 - 60  # время отправки из Telegram, а не время получения
     assert saved.text == "Ответ"
     assert saved.reply_to_message_id == 10
-    assert saved.message_thread_id == 10
+    assert saved.message_thread_id == 4
 
 
 async def test_media_caption_is_saved_and_empty_media_ignored(h):
@@ -142,3 +142,22 @@ def _req(chat_id):
     from service import PERIOD_24H, ManualRequest
 
     return ManualRequest(chat_id=chat_id, user_id=101, period=PERIOD_24H)
+
+
+def test_thread_id_stored_only_for_forum_topic_messages():
+    root = tg_message(CHAT_A, 50, text="корень цепочки")
+    plain_reply = tg_message(CHAT_A, 51, reply_to=root, thread_id=50, is_topic=None)  # ответ вне темы
+    topic_msg = tg_message(CHAT_A, 52, thread_id=4, is_topic=True)
+    assert extract_record(plain_reply).message_thread_id is None
+    assert extract_record(plain_reply).reply_to_message_id == 50
+    assert extract_record(topic_msg).message_thread_id == 4
+
+
+def test_fill_thread_ids_only_fills_missing(h):
+    from database import MessageRecord
+
+    h.db.upsert_message(MessageRecord(CHAT_A, 1, 1, None, "A", T0, "x"), T0)
+    h.db.upsert_message(MessageRecord(CHAT_A, 2, 1, None, "A", T0, "y", message_thread_id=9), T0)
+    assert h.db.fill_thread_ids([(4, CHAT_A, 1), (4, CHAT_A, 2), (4, CHAT_A, 3)]) == 1
+    threads = {m.message_id: m.message_thread_id for m in h.db.get_messages(CHAT_A, 0, T0 + 1)}
+    assert threads == {1: 4, 2: 9}  # собранное ботом значение не перезаписано

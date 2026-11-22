@@ -30,3 +30,6 @@ ChatExport*.zip
 *.zip
 result.json
 summary-preview*.html
+
+# Служебные файлы Claude Code
+.claude-resume

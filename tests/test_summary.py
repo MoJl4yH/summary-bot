@@ -232,3 +232,38 @@ async def test_message_time_includes_weekday(h):
     assert '"time": "сб 21.11 22:59"' in h.llm.user_contents()[0]
     assert "Период: сб 20.11.2026" not in h.llm.user_contents()[0]  # 20.11 — пятница
     assert "Период: пт 20.11.2026 23:00" in h.llm.user_contents()[0]
+
+
+async def test_summary_uses_only_configured_forum_topic(tmp_path):
+    from database import MessageRecord
+
+    h = build_harness(tmp_path, SUMMARY_SOURCE_THREADS="4")
+    try:
+        def add(mid, thread, text):
+            h.db.upsert_message(MessageRecord(CHAT_A, mid, USER_ALICE, None, "Алиса", T0 - 600 + mid, text,
+                                              message_thread_id=thread), T0)
+        add(1, 4, "основная тема раз")
+        add(2, 4, "основная тема два")
+        add(3, 71168, "другая тема")
+        add(4, None, "General")
+        assert await h.service.run_manual(req()) is True
+        sent = h.llm.user_contents()[0]
+        assert '"id": 1' in sent and '"id": 2' in sent
+        assert "другая тема" not in sent and "General" not in sent
+        assert "2 сообщения" in h.bot.texts()[0]
+        assert h.db.count_messages(CHAT_A, T0 - 86400, frozenset({4})) == 2
+        assert "Сводки учитывают только темы: 4" in h.app.status_text(CHAT_A)
+    finally:
+        await h.close()
+
+
+def test_source_threads_config(tmp_path):
+    from config import load_settings
+    from conftest import CHAT_B, make_env
+
+    s = load_settings(make_env(tmp_path))
+    assert s.source_threads(CHAT_A) is None
+    s = load_settings(make_env(tmp_path, SUMMARY_SOURCE_THREADS="4"))
+    assert s.source_threads(CHAT_A) == frozenset({4}) == s.source_threads(CHAT_B)
+    s = load_settings(make_env(tmp_path, SUMMARY_SOURCE_THREADS=f"{CHAT_A}:4,{CHAT_A}:7,{CHAT_B}:9"))
+    assert s.source_threads(CHAT_A) == frozenset({4, 7}) and s.source_threads(CHAT_B) == frozenset({9})

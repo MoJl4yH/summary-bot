@@ -50,6 +50,7 @@ class Settings:
     allowed_user_ids: frozenset[int]
     ignore_bot_messages: bool
     summary_thread_ids: dict[int, int]  # chat_id -> message_thread_id для плановых сводок (форумы)
+    summary_source_threads: dict[int, frozenset[int]]  # chat_id -> темы, по которым строятся сводки
     # Расписание
     timezone: str
     daily_enabled: bool
@@ -91,6 +92,10 @@ class Settings:
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
+
+    def source_threads(self, chat_id: int) -> frozenset[int] | None:
+        """Темы форума, из которых берутся сообщения для сводок; None — вся группа."""
+        return self.summary_source_threads.get(chat_id) or self.summary_source_threads.get(0)
 
     def summary_thread_id(self, chat_id: int) -> int | None:
         return self.summary_thread_ids.get(chat_id, self.summary_thread_ids.get(0))
@@ -191,6 +196,22 @@ class _Reader:
                 self.errors.append(f"{name}: '{part}' — ожидается номер темы или chat_id:номер_темы")
         return result
 
+    def thread_sets(self, name: str) -> dict[int, frozenset[int]]:
+        """«4» или «4,7» — для всех групп; «-100…:4,-100…:7» — по группам."""
+        value = self.raw(name)
+        if value is None:
+            return {}
+        result: dict[int, set[int]] = {}
+        for part in re.split(r"[,\s;]+", value):
+            if not part:
+                continue
+            chat, sep, thread = part.rpartition(":")
+            try:
+                result.setdefault(int(chat) if sep else 0, set()).add(int(thread))
+            except ValueError:
+                self.errors.append(f"{name}: '{part}' — ожидается номер темы или chat_id:номер_темы")
+        return {chat: frozenset(threads) for chat, threads in result.items()}
+
     def int_set(self, name: str, *fallbacks: str) -> frozenset[int]:
         value = self.raw(name, *fallbacks)
         if value is None:
@@ -232,6 +253,7 @@ def load_settings(env: Mapping[str, str] | None = None, *, use_dotenv: bool = Tr
         allowed_user_ids=r.int_set("ALLOWED_USER_IDS"),
         ignore_bot_messages=r.bool("IGNORE_BOT_MESSAGES", True),
         summary_thread_ids=r.thread_map("SUMMARY_THREAD_ID"),
+        summary_source_threads=r.thread_sets("SUMMARY_SOURCE_THREADS"),
         timezone=timezone_name,
         daily_enabled=r.bool("DAILY_SUMMARY_ENABLED", True),
         daily_time=r.time("DAILY_SUMMARY_TIME", "22:00", "SUMMARY_TIME"),

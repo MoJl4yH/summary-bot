@@ -20,6 +20,7 @@ Telegram Desktop → группа → ⋮ → «Экспорт истории ч
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import asyncio
 import json
 import os
@@ -180,6 +181,33 @@ def write_preview(path: Path, parts: list[str], meta: str) -> None:
 
 # ------------------------------------------------------------------ сценарий
 
+def infer_topics(records: list[MessageRecord]) -> list[MessageRecord]:
+    """Восстанавливает тему форума по цепочкам ответов (в экспорте номера темы нет).
+
+    В форуме каждое сообщение темы «отвечает» либо на корневое сообщение темы (его нет
+    в экспорте — это служебное сообщение создания темы), либо на другое сообщение той же темы.
+    Без ответа — сообщение основной темы (General). Ответ на сообщение старше выгрузки
+    неотличим от корня темы, поэтому такое сообщение может получить неверный номер.
+    Записи должны идти по возрастанию времени.
+    """
+    if any(r.message_thread_id is not None for r in records):
+        return records  # номера тем уже есть в данных
+    topic: dict[int, int | None] = {}
+    known = {r.message_id for r in records}
+    result = []
+    for r in records:
+        reply = r.reply_to_message_id
+        if reply is None:
+            thread = None
+        elif reply in known:
+            thread = topic.get(reply)
+        else:
+            thread = reply
+        topic[r.message_id] = thread
+        result.append(replace(r, message_thread_id=thread))
+    return result
+
+
 def drop_external_replies(records: list[MessageRecord]) -> list[MessageRecord]:
     """Ответы на сообщения вне выгрузки (в форумах — корень темы) модели ничего не дают."""
     known = {r.message_id for r in records}
@@ -212,12 +240,12 @@ def load_export(path: Path, chat_query: str | None, chat_id: int | None, tz: Zon
                 reply_to_message_id=m.reply_to,
             ))
         records.sort(key=lambda r: (r.date, r.message_id))
-        return export.chat_name, chat_id, drop_external_replies(records)
+        return export.chat_name, chat_id, drop_external_replies(infer_topics(records))
 
     data = json.loads(path.read_text(encoding="utf-8"))
     chat = select_chat(data, chat_query)
     chat_id = chat_id if chat_id is not None else chat_id_from_export(chat)
-    return chat.get("name"), chat_id, drop_external_replies(parse_export(chat, chat_id, tz))
+    return chat.get("name"), chat_id, drop_external_replies(infer_topics(parse_export(chat, chat_id, tz)))
 
 
 async def run(args) -> int:
@@ -229,7 +257,13 @@ async def run(args) -> int:
     period = PERIOD_7D if args.period == "7d" else PERIOD_24H
     end = window_end(args.end, records, tz)
     start = end - period.seconds
-    window = [r for r in records if start <= r.date < end]
+    threads = frozenset(args.thread) if args.thread else settings.source_threads(chat_id or 0)
+    window = [r for r in records if start <= r.date < end and (not threads or r.message_thread_id in threads)]
+    topics = Counter(r.message_thread_id for r in records if r.message_thread_id is not None)
+    if topics:
+        print("Самые активные темы (номер: сообщений): "
+              + ", ".join(f"{t}: {n}" for t, n in topics.most_common(5))
+              + (f"; в сводку берутся только темы {', '.join(map(str, sorted(threads)))}" if threads else ""))
 
     print(f"Чат: {chat_name} (chat_id {chat_id if chat_id is not None else 'неизвестен — укажите --chat-id для ссылок'})")
     print(f"Текстовых сообщений в экспорте: {len(records)}"
@@ -244,8 +278,12 @@ async def run(args) -> int:
         db.ensure_schema()
         now = int(time.time())
         inserted = sum(db.upsert_message(r, now) for r in records)
+        filled = db.fill_thread_ids(
+            [(r.message_thread_id, r.chat_id, r.message_id) for r in records if r.message_thread_id is not None]
+        )
         db.close()
-        print(f"Импорт в {args.import_db}: добавлено {inserted}, уже было {len(records) - inserted}")
+        print(f"Импорт в {args.import_db}: добавлено {inserted}, уже было {len(records) - inserted}, "
+              f"проставлен номер темы: {filled}")
 
     if args.no_summary:
         return 0
@@ -326,6 +364,8 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="не обращаться к LLM, только оценить объём")
     parser.add_argument("--import-db", help="загрузить сообщения экспорта в SQLite-базу бота")
     parser.add_argument("--no-summary", action="store_true", help="не формировать сводку (например, только импорт)")
+    parser.add_argument("--thread", type=int, action="append",
+                        help="только эта тема форума (можно несколько раз); по умолчанию SUMMARY_SOURCE_THREADS")
     return asyncio.run(run(parser.parse_args()))
 
 
